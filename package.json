@@ -10,10 +10,13 @@
   "devDependencies": {
     "eslint": "^10.10.0",
     "jest": "^30.3.0",
-    "supertest": "^7.1.0"
+    "supertest": "^7.3.2"
   },
   "engines": {
     "node": ">=24.0.0"
   },
-  "license": "Apache-2.0"
+  "license": "Apache-2.0",
+  "dependencies": {
+    "express": "^5.2.1"
+  }
 }
