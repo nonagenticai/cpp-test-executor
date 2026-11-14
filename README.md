@@ -1,27 +1,50 @@
 # cpp-test-executor
 
+[![CI](https://github.com/nonagenticai/cpp-test-executor/actions/workflows/ci.yml/badge.svg)](https://github.com/nonagenticai/cpp-test-executor/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 Sandboxed C++ test execution service for the code_graph_helper platform. Accepts C++ source code and test code over HTTP, compiles and runs them inside the container using the requested build system and test framework, and returns structured results including build output, test results, code coverage, static analysis, and memory checking.
 
 This is one of seven language-specific test executor sidecars. The `coding-testing` service (port 8689) dispatches test execution requests to it and aggregates results.
 
-## Port: 8094
+| | |
+|---|---|
+| **Runtime** | Node.js 24 in the image (`deb.nodesource.com/setup_24.x`), Express 5; `engines` requires Node >= 24 |
+| **Depends on** | Debian 12 with gcc/g++/clang, CMake/Make/Ninja, GTest/Catch2/CppUnit, cppcheck/clang-tidy/clang-format, valgrind, lcov/gcovr |
+| **Runs on** | Container / `docker compose`; not deployed to the estate cluster |
 
-## Architecture
+## Quick start
 
-Single-file Express.js server (`src/cpp_test_service.js`) running inside a Debian container that has the full C++ toolchain pre-installed. Each execution request gets its own temporary workspace directory under `/app/test_workspace`, runs through configure/build/test steps, and cleans up on success (preserves workspace on failure for debugging).
+```bash
+git clone https://github.com/nonagenticai/cpp-test-executor.git
+cd cpp-test-executor
+docker compose up -d --build
+curl -s http://localhost:8094/health
+```
 
-### Pre-installed Tools
+`/health` is unauthenticated. Every other route requires an `X-Tenant-Id` header — an orchestrator marker, not cryptographic authentication.
 
-| Category | Tools |
-|----------|-------|
-| Compilers | gcc, g++, clang |
-| Build systems | cmake, make, ninja |
-| Test frameworks | Google Test (GTest), Catch2, CppUnit |
-| Static analysis | cppcheck, clang-tidy, clang-format |
-| Memory checking | valgrind |
-| Coverage | lcov, gcovr |
+## Usage
+
+One function and one Google Test case, submitted over HTTP:
+
+```bash
+curl -s http://localhost:8094/execute \
+  -H 'Content-Type: application/json' \
+  -H 'X-Tenant-Id: local' \
+  -d '{
+    "code": "#include <string>\nstd::string greet() { return \"hi\"; }",
+    "testCode": "#include <gtest/gtest.h>\n#include <string>\nstd::string greet();\nTEST(Greet, ReturnsHi) { EXPECT_EQ(greet(), \"hi\"); }",
+    "framework": "gtest",
+    "buildSystem": "cmake"
+  }'
+```
+
+The source defines no `main()`, so it is built as a static library and linked into the test binary. `success` is `true` only when configure and build succeed, the test command exits 0, and the run is not a measured zero-collection.
 
 ## API
+
+All routes except `/health` (and the `/healthz`, `/ready` and `/` aliases) return HTTP 401 without an `X-Tenant-Id` header.
 
 ### `GET /health`
 
@@ -63,6 +86,8 @@ Syntax-checks C++ code (compiles with `-fsyntax-only`) and runs cppcheck static 
   "language": "cpp"
 }
 ```
+
+`language` is accepted for compatibility and does not change compilation; the service always compiles as C++.
 
 **Response:**
 ```json
@@ -109,8 +134,8 @@ Detection ignores `main(` appearing in comments and string literals, and treats 
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `code` | string | required | Source code to compile |
-| `testCode` | string | `""` | Test code; if empty, only compilation is verified |
+| `code` | string | `""` | Source code to compile; absent is treated as empty source |
+| `testCode` | string | `""` | Test code; if empty, only compilation is verified and `success` is `false` |
 | `testType` | string | `"unit"` | Label only (unit, integration, etc.) |
 | `framework` | string | `"gtest"` | `gtest`, `catch2`, or `cppunit` |
 | `buildSystem` | string | `"cmake"` | `cmake`, `make`, or `ninja` |
@@ -127,6 +152,10 @@ Detection ignores `main(` appearing in comments and string literals, and treats 
   "framework": "gtest",
   "buildSystem": "cmake",
   "success": true,
+  "testsRun": 1,
+  "noTestsRun": false,
+  "no_tests_run": false,
+  "no_tests_run_unknown": false,
   "steps": [
     { "name": "configure", "success": true, "output": "...", "errors": "...", "duration": 1234 },
     { "name": "build", "success": true, "output": "...", "errors": "...", "duration": 5678 },
@@ -139,33 +168,52 @@ Detection ignores `main(` appearing in comments and string literals, and treats 
 }
 ```
 
-Execution stops early if configure or build fails -- subsequent steps are skipped and `success` is `false`.
+`success` is `true` only when configure and build succeed, the test command exits 0, and the run is not a measured zero-collection. A request without `testCode` builds but returns `success: false`. `testsRun` is best-effort; `no_tests_run_unknown` means the framework did not expose a trustworthy test count.
 
-## Environment Variables
+Execution stops early if configure or build fails -- subsequent steps are skipped and `success` is `false`. The workspace is deleted after a successful run and preserved on failure for debugging.
+
+## Configuration
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PORT` | `8094` | Listen port |
-| `CPP_TEST_PORT` | `8094` | Alternate port variable (fallback) |
+| `CPP_TEST_PORT` | `8094` | Alternate port variable (fallback when `PORT` is unset) |
 | `EXECUTION_TIMEOUT` | `300` | Default per-step timeout in seconds |
 | `TEST_WORKSPACE` | `/app/test_workspace` | Temp directory for build workspaces |
 | `REPORTS_DIR` | `/app/reports` | Directory for generated reports |
+
+The workspace and reports directories must be writable by the process.
+
+## Development
+
+```bash
+npm ci
+npm run lint
+npm test
+```
+
+Node.js 24 or newer is required. `npm test` runs eslint through `pretest`, then the Jest suite configured in `jest.config.cjs`.
+
+## Architecture
+
+Express server in `src/cpp_test_service.js`, with shared Express helpers in `src/common.js`, running inside a Debian container that has the full C++ toolchain pre-installed. Each execution request gets its own temporary workspace directory under `/app/test_workspace`, runs through configure/build/test steps, and cleans up on success (preserves workspace on failure for debugging).
+
+### Pre-installed Tools
+
+| Category | Tools |
+|----------|-------|
+| Compilers | gcc, g++, clang |
+| Build systems | cmake, make, ninja |
+| Test frameworks | Google Test (GTest), Catch2, CppUnit |
+| Static analysis | cppcheck, clang-tidy, clang-format |
+| Memory checking | valgrind |
+| Coverage | lcov, gcovr |
 
 ## Dependencies
 
 - **Upstream caller:** `coding-testing` (port 8689) sends requests to `http://cpp-test-executor:8094/execute` via `HttpTestRunner`
 - **No downstream dependencies** -- this service only shells out to local compiler/test tools
-- **Node.js packages:** express, uuid (see `src/package.json`)
-
-## Running
-
-```bash
-# Standalone via docker-compose
-docker compose up -d
-
-# As part of the full platform (from code_graph_helper root)
-docker compose up -d cpp-test-executor
-```
+- **Node.js packages:** `express` only (IDs are generated with `crypto.randomUUID`); see `src/package.json`
 
 ## CI/CD
 
@@ -173,17 +221,23 @@ GitHub Actions on `nonagenticai/cpp-test-executor`, via the public `ci-workflows
 1. Secret scan and private-infrastructure scan
 2. `npm ci`, eslint, the jest suite
 3. Image build and a `/health` smoke against it
-4. From `main`: push `sha-<commit>` + `latest` to `ghcr.io/nonagenticai/cpp-test-executor` with a SLSA provenance attestation
+4. From `main`: push `sha-<short-commit>` + `latest` to `ghcr.io/nonagenticai/cpp-test-executor` with a SLSA provenance attestation
 
 There is no deploy job: this service is retired from the estate's cluster, and the repository is published so its tests, image build and job contract stay reproducible.
 
-## Licensing
+## Security
 
-The code in this repository is Apache-2.0 and needs no licence key to build, test or run.
-It contains no licence-enforcement code: the Apache-2.0 licence in [`LICENSE`](LICENSE) is the
-only licence that applies, and no licence server is involved.
+Report vulnerabilities privately through the repository's Security tab — see the organisation policy in
+[`nonagenticai/.github/SECURITY.md`](https://github.com/nonagenticai/.github/blob/main/SECURITY.md). Do not open a public issue for a security problem.
 
+The `X-Tenant-Id` guard is a routing marker, not authentication. The service is stateless and expects network-level isolation.
+
+## Contributing
+
+Issues and pull requests are welcome. See
+[`CONTRIBUTING.md`](https://github.com/nonagenticai/.github/blob/main/CONTRIBUTING.md) for the
+organisation-wide rules; this repository's own commands are in **Development** above.
 
 ## License
 
-Apache-2.0 — see [`LICENSE`](LICENSE).
+Apache-2.0 — see [`LICENSE`](LICENSE). The code needs no licence key to build, test or run, and contains no licence-enforcement code: the Apache-2.0 licence is the only licence that applies, and no licence server is involved.
