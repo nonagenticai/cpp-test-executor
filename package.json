@@ -1,0 +1,19 @@
+{
+  "private": true,
+  "type": "commonjs",
+  "description": "CI manifest for cpp-test-executor: runs eslint + jest unit tests via the ts-service archetype. The shipped service lives in src/ and is built by the Dockerfile.",
+  "scripts": {
+    "lint": "eslint .",
+    "pretest": "eslint .",
+    "test": "jest --forceExit"
+  },
+  "devDependencies": {
+    "eslint": "^10.10.0",
+    "jest": "^30.3.0",
+    "supertest": "^7.1.0"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "license": "Apache-2.0"
+}
