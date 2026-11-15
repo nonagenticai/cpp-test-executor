@@ -191,14 +191,89 @@ function codeDefinesMain(code) {
     return /(^|[^\w:])main\s*\([^;()]*\)\s*(?:->[^{;]+)?\{/.test(stripped);
 }
 
+/**
+ * A code unit that ECMAScript's `.` refuses to match.
+ */
+function isLineTerminator(ch) {
+    const code = ch.charCodeAt(0);
+    return code === 10 || code === 13 || code === 0x2028 || code === 0x2029;
+}
+
+/**
+ * Replace quoted literals with `replacement`, scanning each candidate once.
+ *
+ * This replaces /"(?:\\.|[^"\\])*"/g (and the single-quote form), which CodeQL
+ * flagged as js/polynomial-redos: on '"' followed by many '\"' repetitions the
+ * engine exhausts the escape pairs, finds no closing quote, then restarts at
+ * the next quote inside the run and re-reads the same suffix — once per
+ * repetition. The scanner walks from each opening quote to its close: an
+ * escape pair is exactly two code units and cannot contain a line terminator
+ * (`.` does not match one), a closing quote ends the literal, and anything
+ * else is consumed.
+ *
+ * A start that fails is not retried at every quote it passed. Every quote
+ * between the opening quote and the failure point was itself consumed as part
+ * of an escape pair, so a fresh start at one of them follows the identical
+ * token path from that position and fails in the same place; at EOF the same
+ * argument says nothing in the remainder can match at all. Those regions are
+ * therefore skipped in one step, which is what keeps this linear.
+ */
+function stripQuotedLiterals(code, quote, replacement) {
+    let output = '';
+    let index = 0;
+    for (;;) {
+        const start = code.indexOf(quote, index);
+        if (start === -1) {
+            return output + code.slice(index);
+        }
+
+        let cursor = start + 1;
+        let close = -1;
+        let failedAt = -1;
+        while (cursor < code.length) {
+            const ch = code[cursor];
+            if (ch === '\\') {
+                const next = code[cursor + 1];
+                if (next === undefined || isLineTerminator(next)) {
+                    failedAt = cursor;
+                    break;
+                }
+                cursor += 2;
+                continue;
+            }
+            if (ch === quote) {
+                close = cursor;
+                break;
+            }
+            cursor += 1;
+        }
+
+        if (close === -1) {
+            if (failedAt === -1) {
+                // Ran off the end without a closing quote: no quote after the
+                // opening one can start a match either, so the remainder is
+                // unchanged.
+                return output + code.slice(index);
+            }
+            // Skip the whole failed candidate region in one step.
+            output += code.slice(index, failedAt);
+            index = failedAt;
+            continue;
+        }
+
+        output += code.slice(index, start) + replacement;
+        index = close + 1;
+    }
+}
+
 /** Replace string literals with an empty literal. */
 function stripStringLiterals(code) {
-    return code.replace(/"(?:\\.|[^"\\])*"/g, '""');
+    return stripQuotedLiterals(code, '"', '""');
 }
 
 /** Replace character literals with an empty literal. */
 function stripCharLiterals(code) {
-    return code.replace(/'(?:\\.|[^'\\])*'/g, "''");
+    return stripQuotedLiterals(code, "'", "''");
 }
 
 /**
@@ -1072,6 +1147,8 @@ module.exports = {
     renderMakefile,
     stripBlockComments,
     stripLineComments,
+    stripStringLiterals,
+    stripCharLiterals,
     // Exported so the "is this count authoritative?" rule is assertable on its
     // own. The blind spot it encodes is the point of the whole change.
     describeCppTestCount,
