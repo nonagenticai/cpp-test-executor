@@ -19,6 +19,7 @@ const {
     installGracefulShutdown,
 } = require('./common');
 const { spawn, exec } = require('child_process');
+const { rateLimit } = require('express-rate-limit');
 const fs = require('fs').promises;
 const path = require('path');
 const crypto = require('crypto');
@@ -29,6 +30,32 @@ const PORT = process.env.PORT || process.env.CPP_TEST_PORT || 8094;
 const EXECUTION_TIMEOUT = parseInt(process.env.EXECUTION_TIMEOUT || '300') * 1000; // 5 minutes for C++ builds
 const TEST_WORKSPACE = process.env.TEST_WORKSPACE || '/app/test_workspace';
 const REPORTS_DIR = process.env.REPORTS_DIR || '/app/reports';
+
+// ── Rate limiting ───────────────────────────────────────────────────────────
+// /execute scaffolds, writes, configures, builds and tests a C++ project on
+// disk; /validate writes a source file and runs g++ and cppcheck. Each request
+// is seconds to minutes of CPU and scratch-disk churn, and CodeQL
+// js/missing-rate-limiting raised both routes. This is an in-process counter
+// keyed on the caller's address: the orchestrator is the only caller
+// (tenantGuard), so there is one meaningful bucket, and an external attacker
+// cannot bypass it by rotating addresses. Defaults: 60 requests per 60 s,
+// overridable with RATE_LIMIT_MAX / RATE_LIMIT_WINDOW_MS. Invalid overrides
+// fall back to the default rather than disabling the limit.
+function positiveIntFromEnv(name, fallback) {
+    const parsed = Number.parseInt(process.env[name], 10);
+    return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+const RATE_LIMIT_MAX = positiveIntFromEnv('RATE_LIMIT_MAX', 60);
+const RATE_LIMIT_WINDOW_MS = positiveIntFromEnv('RATE_LIMIT_WINDOW_MS', 60 * 1000);
+
+const expensiveRouteLimiter = rateLimit({
+    windowMs: RATE_LIMIT_WINDOW_MS,
+    limit: RATE_LIMIT_MAX,
+    standardHeaders: true, // RateLimit-Limit / -Remaining / -Reset on responses
+    legacyHeaders: false,
+    message: { error: 'Too many requests', detail: 'This executor is rate-limited.' },
+});
 
 // Initialize Express app with shared setup + orchestrator-only tenant guard
 const app = setupExpress({ jsonLimit: '50mb' });
@@ -77,6 +104,60 @@ const CPP_TOOLS = {
 
 // Build systems
 /**
+ * Remove block comments with a single left-to-right scan.
+ *
+ * The regex it replaces, /\/\*[\s\S]*?\*\//g, was flagged as
+ * js/polynomial-redos: on an unterminated '/*' followed by many 'a/*'
+ * repetitions the lazy group retries the closing star-slash from every
+ * position of the suffix, and the global flag then restarts that scan at every
+ * later '/*'. Each candidate start is skipped with indexOf and a match consumes
+ * its bytes, so the whole input is walked once. An unterminated '/*' is left
+ * untouched, exactly as the old regex left it.
+ */
+function stripBlockComments(code) {
+    let output = '';
+    let index = 0;
+    for (;;) {
+        const start = code.indexOf('/*', index);
+        if (start === -1) {
+            return output + code.slice(index);
+        }
+        output += code.slice(index, start);
+        const end = code.indexOf('*/', start + 2);
+        if (end === -1) {
+            return output + code.slice(start);
+        }
+        output += ' ';
+        index = end + 2;
+    }
+}
+
+/**
+ * Remove line comments with a single left-to-right scan.
+ *
+ * Equivalent to the old global line-comment replace: everything from '//' up
+ * to (not including) the next newline is removed, so a trailing carriage
+ * return is part of the comment. Kept as a scanner for the same reason as
+ * stripBlockComments — no repeated re-scanning of the suffix.
+ */
+function stripLineComments(code) {
+    let output = '';
+    let index = 0;
+    for (;;) {
+        const start = code.indexOf('//', index);
+        if (start === -1) {
+            return output + code.slice(index);
+        }
+        output += code.slice(index, start) + ' ';
+        const newline = code.indexOf('\n', start + 2);
+        if (newline === -1) {
+            return output;
+        }
+        index = newline; // keep the newline itself
+    }
+}
+
+/**
  * Does the submitted code define its own entry point?
  *
  * This decides the whole shape of the generated build. The old template
@@ -95,11 +176,11 @@ function codeDefinesMain(code) {
     // `add_executable(main main.cpp)` against a file with no main(), i.e. the
     // exact `undefined reference to 'main'` this function exists to prevent,
     // and on the make path it also dropped code_under_test.o from the link line.
-    const stripped = (code || '')
-        .replace(/\/\*[\s\S]*?\*\//g, ' ')   // block comments
-        .replace(/\/\/[^\n]*/g, ' ')          // line comments
-        .replace(/"(?:\\.|[^"\\])*"/g, '""')  // string literals
-        .replace(/'(?:\\.|[^'\\])*'/g, "''"); // char literals
+    const stripped = stripCharLiterals(
+        stripStringLiterals(
+            stripLineComments(stripBlockComments(code || ''))
+        )
+    );
 
     // Require a DEFINITION, not a declaration: the parameter list must be
     // followed by a body. `int main();` is a forward declaration -- linking as
@@ -108,6 +189,91 @@ function codeDefinesMain(code) {
     // Not handled, and deliberately so: a main() inside `#if 0`. Detecting that
     // needs a preprocessor, and guessing wrong is worse than the honest answer.
     return /(^|[^\w:])main\s*\([^;()]*\)\s*(?:->[^{;]+)?\{/.test(stripped);
+}
+
+/**
+ * A code unit that ECMAScript's `.` refuses to match.
+ */
+function isLineTerminator(ch) {
+    const code = ch.charCodeAt(0);
+    return code === 10 || code === 13 || code === 0x2028 || code === 0x2029;
+}
+
+/**
+ * Replace quoted literals with `replacement`, scanning each candidate once.
+ *
+ * This replaces /"(?:\\.|[^"\\])*"/g (and the single-quote form), which CodeQL
+ * flagged as js/polynomial-redos: on '"' followed by many '\"' repetitions the
+ * engine exhausts the escape pairs, finds no closing quote, then restarts at
+ * the next quote inside the run and re-reads the same suffix — once per
+ * repetition. The scanner walks from each opening quote to its close: an
+ * escape pair is exactly two code units and cannot contain a line terminator
+ * (`.` does not match one), a closing quote ends the literal, and anything
+ * else is consumed.
+ *
+ * A start that fails is not retried at every quote it passed. Every quote
+ * between the opening quote and the failure point was itself consumed as part
+ * of an escape pair, so a fresh start at one of them follows the identical
+ * token path from that position and fails in the same place; at EOF the same
+ * argument says nothing in the remainder can match at all. Those regions are
+ * therefore skipped in one step, which is what keeps this linear.
+ */
+function stripQuotedLiterals(code, quote, replacement) {
+    let output = '';
+    let index = 0;
+    for (;;) {
+        const start = code.indexOf(quote, index);
+        if (start === -1) {
+            return output + code.slice(index);
+        }
+
+        let cursor = start + 1;
+        let close = -1;
+        let failedAt = -1;
+        while (cursor < code.length) {
+            const ch = code[cursor];
+            if (ch === '\\') {
+                const next = code[cursor + 1];
+                if (next === undefined || isLineTerminator(next)) {
+                    failedAt = cursor;
+                    break;
+                }
+                cursor += 2;
+                continue;
+            }
+            if (ch === quote) {
+                close = cursor;
+                break;
+            }
+            cursor += 1;
+        }
+
+        if (close === -1) {
+            if (failedAt === -1) {
+                // Ran off the end without a closing quote: no quote after the
+                // opening one can start a match either, so the remainder is
+                // unchanged.
+                return output + code.slice(index);
+            }
+            // Skip the whole failed candidate region in one step.
+            output += code.slice(index, failedAt);
+            index = failedAt;
+            continue;
+        }
+
+        output += code.slice(index, start) + replacement;
+        index = close + 1;
+    }
+}
+
+/** Replace string literals with an empty literal. */
+function stripStringLiterals(code) {
+    return stripQuotedLiterals(code, '"', '""');
+}
+
+/** Replace character literals with an empty literal. */
+function stripCharLiterals(code) {
+    return stripQuotedLiterals(code, "'", "''");
 }
 
 /**
@@ -519,7 +685,7 @@ app.get('/frameworks', (req, res) => {
 });
 
 // Code validation endpoint
-app.post('/validate', async (req, res) => {
+app.post('/validate', expensiveRouteLimiter, async (req, res) => {
     try {
         const { code, language = 'cpp' } = req.body;
         
@@ -585,7 +751,7 @@ app.post('/validate', async (req, res) => {
 });
 
 // Main test execution endpoint
-app.post('/execute', async (req, res) => {
+app.post('/execute', expensiveRouteLimiter, async (req, res) => {
     const startTime = Date.now();
     const executionId = crypto.randomUUID();
     
@@ -979,6 +1145,10 @@ module.exports = {
     codeDefinesMain,
     renderCMakeLists,
     renderMakefile,
+    stripBlockComments,
+    stripLineComments,
+    stripStringLiterals,
+    stripCharLiterals,
     // Exported so the "is this count authoritative?" rule is assertable on its
     // own. The blind spot it encodes is the point of the whole change.
     describeCppTestCount,
